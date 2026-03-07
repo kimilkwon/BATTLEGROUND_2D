@@ -104,7 +104,7 @@ class MenuScene extends Phaser.Scene {
       this.add.text(W/2,H*0.70+i*22,h,{fontSize:'12px',color:'#6b7280'}).setOrigin(0.5);
     });
 
-    socket.on('game_start', data=>{
+    socket.once('game_start', data=>{
       if(this.inputDiv&&document.body.contains(this.inputDiv)) document.body.removeChild(this.inputDiv);
       this.scene.start('Game',data);
     });
@@ -139,7 +139,7 @@ class WaitScene extends Phaser.Scene {
 
     socket.emit('join',{name:this.name});
     socket.on('waiting',({count})=>{ if(this.countText) this.countText.setText(`대기 중 ${count}명`); });
-    socket.on('game_start',data=>{
+    socket.once('game_start',data=>{
       if(this.cancelDiv&&document.body.contains(this.cancelDiv)) document.body.removeChild(this.cancelDiv);
       this.scene.start('Game',data);
     });
@@ -181,6 +181,9 @@ class GameScene extends Phaser.Scene {
     this.keys=this.input.keyboard.addKeys('W,A,S,D,R,G,E,F,ONE,TWO,THREE,FOUR,FIVE,SIX,SEVEN,EIGHT,SHIFT');
     this.input.mouse.disableContextMenu();
 
+    // 중복 텍스처 방지 (씬 재시작 시 발생 가능)
+    if (this.textures.exists('fog')) this.textures.remove('fog');
+    if (this.textures.exists('mm'))  this.textures.remove('mm');
     this.fogCT=this.textures.createCanvas('fog',W,H);
     this.fogImg=this.add.image(0,0,'fog').setOrigin(0,0).setDepth(80).setScrollFactor(0);
 
@@ -754,8 +757,8 @@ class GameScene extends Phaser.Scene {
         g.fillStyle(0x1a1a1a,0.8); g.fillRect(p.x-13,p.y-24,26,5);
         g.fillStyle(p.hp>50?0x22c55e:p.hp>25?0xf59e0b:0xef4444);
         g.fillRect(p.x-13,p.y-24,hw,5);
-        this.add.text(p.x,p.y-30,p.name,{fontSize:'10px',color:'#e5e7eb',stroke:'#000',strokeThickness:3})
-          .setDepth(11).setOrigin(0.5).setName('__nametag');
+        // 네임태그: 매 프레임 동적 그래픽스(dynG)에 배경박스만 표시 (텍스트 누수 방지)
+        g.fillStyle(0x000000,0.55); g.fillRect(p.x-24,p.y-34,48,13);
       }
     }
 
@@ -823,7 +826,8 @@ class GameScene extends Phaser.Scene {
 
   // ── Fog ──────────────────────────────────────────────────
   _updateFog() {
-    const me=this.gs?.players.find(p=>p.sid===this.myId);
+    const me=this.gs?.players.find(p=>p.sid===this.myId)
+           || this.gs?.players.find(p=>p.alive); // 폴백: 살아있는 첫 플레이어
     if (!me||!me.alive) return;
     const cam=this.cameras.main;
     const sx=me.x-cam.scrollX, sy=me.y-cam.scrollY;
@@ -1107,7 +1111,4 @@ const config = {
 
 const game = new Phaser.Game(config);
 
-socket.on('game_start', data=>{
-  if (!game.scene.isActive('Menu')) return;
-  game.scene.getScene('Menu')?.scene?.start('Game',data);
-});
+// game_start 는 각 씬(MenuScene/WaitScene)의 socket.once 핸들러가 처리
