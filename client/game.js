@@ -164,6 +164,8 @@ class GameScene extends Phaser.Scene {
     this.nearItems=[]; this.nearestItem=null;
     this.mechaTimeLeft=0; this.stunEnd=0;
     this.myAngle=0;
+    // Interpolation
+    this.interpPlayers={}; this.predX=undefined; this.predY=undefined;
     // Mobile state
     this.mobileState={joyX:0,joyY:0,firing:false,aiming:false,aimAngle:0,sprint:false};
     this._mobOv=null;
@@ -552,9 +554,35 @@ class GameScene extends Phaser.Scene {
   // ── Socket ───────────────────────────────────────────────
   _setupSocket() {
     socket.on('state', data=>{
+      const now=Date.now();
+      // Update interpolation buffers for all players
+      for(const p of data.players){
+        const ip=this.interpPlayers[p.sid];
+        if(!ip){
+          this.interpPlayers[p.sid]={x:p.x,y:p.y,angle:p.angle||0,
+            prevX:p.x,prevY:p.y,prevAngle:p.angle||0,
+            targetX:p.x,targetY:p.y,targetAngle:p.angle||0,lastUpdate:now};
+        } else {
+          ip.prevX=ip.x; ip.prevY=ip.y; ip.prevAngle=ip.angle;
+          ip.targetX=p.x; ip.targetY=p.y; ip.targetAngle=p.angle||0;
+          ip.lastUpdate=now;
+        }
+      }
+      // Clean up disconnected players
+      const alive=new Set(data.players.map(p=>p.sid));
+      for(const sid in this.interpPlayers){ if(!alive.has(sid)) delete this.interpPlayers[sid]; }
       this.gs=data;
       const me=data.players.find(p=>p.sid===this.myId);
-      if (me) { this.camX=me.x; this.camY=me.y; }
+      if(me){
+        if(this.predX===undefined){ this.predX=me.x; this.predY=me.y; }
+        else {
+          // Reconcile prediction with server authority
+          const err=Math.hypot(this.predX-me.x,this.predY-me.y);
+          if(err>80){ this.predX=me.x; this.predY=me.y; } // snap if blocked by wall
+          else { this.predX+=(me.x-this.predX)*0.25; this.predY+=(me.y-this.predY)*0.25; }
+        }
+        this.camX=this.predX; this.camY=this.predY;
+      }
     });
 
     socket.on('reloading',({ms})=>{
@@ -597,6 +625,38 @@ class GameScene extends Phaser.Scene {
   update(time,delta) {
     if (!this.gs) return;
     const dt=delta/1000;
+    const now=Date.now();
+    const TICK_MS=50; // 20Hz server tick
+
+    // ── Step 1: Advance entity interpolation for all players ──
+    for(const sid in this.interpPlayers){
+      const ip=this.interpPlayers[sid];
+      const t=Math.min((now-ip.lastUpdate)/TICK_MS, 1.5);
+      ip.x=ip.prevX+(ip.targetX-ip.prevX)*t;
+      ip.y=ip.prevY+(ip.targetY-ip.prevY)*t;
+      ip.angle=ip.prevAngle+(ip.targetAngle-ip.prevAngle)*Math.min(t*2,1);
+    }
+
+    // ── Step 2: Client-side prediction for local player ──
+    const me=this.gs.players.find(p=>p.sid===this.myId);
+    if(me&&me.alive&&this.myInput&&this.predX!==undefined){
+      const inp=this.myInput;
+      const spd=inp.sprint?220:150;
+      let dx=(inp.right?1:0)-(inp.left?1:0), dy=(inp.down?1:0)-(inp.up?1:0);
+      const len=Math.hypot(dx,dy);
+      if(len>0){
+        const MS=this.mapSize||4000, PR=18;
+        this.predX=Math.max(PR,Math.min(MS-PR,this.predX+dx/len*spd*dt));
+        this.predY=Math.max(PR,Math.min(MS-PR,this.predY+dy/len*spd*dt));
+      }
+      // Override interp entry so render uses predicted position
+      if(this.interpPlayers[this.myId]){
+        this.interpPlayers[this.myId].x=this.predX;
+        this.interpPlayers[this.myId].y=this.predY;
+      }
+      this.camX=this.predX; this.camY=this.predY;
+    }
+
     this._handleInput();
     this._render();
     this._updateFog();
@@ -633,8 +693,9 @@ class GameScene extends Phaser.Scene {
       const cam = this.cameras.main;
       const mx = this.input.mousePointer.x + cam.scrollX;
       const my = this.input.mousePointer.y + cam.scrollY;
-      const me = this.gs?.players.find(p=>p.sid===this.myId);
-      angle = me ? Math.atan2(my-me.y, mx-me.x) : 0;
+      const meX = this.predX ?? this.gs?.players.find(p=>p.sid===this.myId)?.x ?? 0;
+      const meY = this.predY ?? this.gs?.players.find(p=>p.sid===this.myId)?.y ?? 0;
+      angle = Math.atan2(my-meY, mx-meX);
     }
 
     const now = Date.now();
@@ -651,7 +712,7 @@ class GameScene extends Phaser.Scene {
       if (now-this.lastShoot>60) {
         socket.emit('shoot',{angle}); this.lastShoot=now;
         const me2=this.gs?.players.find(p=>p.sid===this.myId);
-        if (me2) this.explosionFx.push({x:me2.x,y:me2.y,r:8,t:now,dur:60,muzzle:true});
+        if (me2) this.explosionFx.push({x:this.predX??me2.x,y:this.predY??me2.y,r:8,t:now,dur:60,muzzle:true});
       }
     }
 
@@ -710,6 +771,8 @@ class GameScene extends Phaser.Scene {
     this._dynG=this.add.graphics().setDepth(10);
     const g=this._dynG;
     const me=this.gs.players.find(p=>p.sid===this.myId);
+    // Virtual me with client-predicted position for proximity checks
+    const vme=me?{...me, x:this.predX??me.x, y:this.predY??me.y}:null;
 
     for(const s of (this.gs.smokes||[])) {
       g.fillStyle(0x888888,0.5); g.fillCircle(s.x,s.y,s.r);
@@ -722,8 +785,8 @@ class GameScene extends Phaser.Scene {
       const col=Phaser.Display.Color.HexStringToColor(ITEM_COLOR[item.type]||'#ffffff');
       g.fillStyle(col.color,0.9); g.fillCircle(item.x,item.y,8);
       g.lineStyle(2,0xffffff,0.5); g.strokeCircle(item.x,item.y,8);
-      if (me) {
-        const d=Math.hypot(item.x-me.x,item.y-me.y);
+      if (vme) {
+        const d=Math.hypot(item.x-vme.x,item.y-vme.y);
         if (d<nearDist) { nearDist=d; nearest=item; }
       }
     }
@@ -742,23 +805,27 @@ class GameScene extends Phaser.Scene {
     for(const p of (this.gs.players||[])) {
       if (!p.alive) continue;
       const isMe=(p.sid===this.myId);
+      // Use interpolated/predicted render positions
+      const ip=this.interpPlayers[p.sid];
+      const rx=isMe?(this.predX??p.x):(ip?ip.x:p.x);
+      const ry=isMe?(this.predY??p.y):(ip?ip.y:p.y);
+      const ra=ip?ip.angle:(p.angle||0);
       const col=isMe?0x00ff88:(p.inMecha?0x4488ff:0xff4444);
-      if (p.inMecha) { g.lineStyle(3,col); g.strokeRect(p.x-24,p.y-24,48,48); }
-      g.fillStyle(col,isMe?1:0.9); g.fillCircle(p.x,p.y,14);
-      const a=p.angle||0;
+      if (p.inMecha) { g.lineStyle(3,col); g.strokeRect(rx-24,ry-24,48,48); }
+      g.fillStyle(col,isMe?1:0.9); g.fillCircle(rx,ry,14);
       g.lineStyle(3,0xffffff,0.9);
-      g.strokeLineShape(new Phaser.Geom.Line(p.x,p.y,p.x+Math.cos(a)*20,p.y+Math.sin(a)*20));
+      g.strokeLineShape(new Phaser.Geom.Line(rx,ry,rx+Math.cos(ra)*20,ry+Math.sin(ra)*20));
       if (p.helmet>0) {
         g.lineStyle(2,[0xffffff,0x60a5fa,0xfbbf24][p.helmet-1]||0x60a5fa,0.7);
-        g.strokeCircle(p.x,p.y,17);
+        g.strokeCircle(rx,ry,17);
       }
       if (!isMe) {
         const hw=26*(p.hp/100);
-        g.fillStyle(0x1a1a1a,0.8); g.fillRect(p.x-13,p.y-24,26,5);
+        g.fillStyle(0x1a1a1a,0.8); g.fillRect(rx-13,ry-24,26,5);
         g.fillStyle(p.hp>50?0x22c55e:p.hp>25?0xf59e0b:0xef4444);
-        g.fillRect(p.x-13,p.y-24,hw,5);
+        g.fillRect(rx-13,ry-24,hw,5);
         // 네임태그: 매 프레임 동적 그래픽스(dynG)에 배경박스만 표시 (텍스트 누수 방지)
-        g.fillStyle(0x000000,0.55); g.fillRect(p.x-24,p.y-34,48,13);
+        g.fillStyle(0x000000,0.55); g.fillRect(rx-24,ry-34,48,13);
       }
     }
 
@@ -769,24 +836,24 @@ class GameScene extends Phaser.Scene {
       else g.fillCircle(b.x,b.y,3);
     }
 
-    if (this.throwing&&me) {
-      g.lineStyle(2,0xfbcb04,0.8); g.strokeCircle(me.x,me.y,340);
+    if (this.throwing&&vme) {
+      g.lineStyle(2,0xfbcb04,0.8); g.strokeCircle(vme.x,vme.y,340);
       if (!IS_MOBILE) {
         const cam=this.cameras.main;
         const mx=this.input.mousePointer.x+cam.scrollX;
         const my2=this.input.mousePointer.y+cam.scrollY;
-        const a=Math.atan2(my2-me.y,mx-me.x);
-        const dist=Math.min(340,Math.hypot(mx-me.x,my2-me.y));
-        const lx=me.x+Math.cos(a)*dist, ly=me.y+Math.sin(a)*dist;
+        const a=Math.atan2(my2-vme.y,mx-vme.x);
+        const dist=Math.min(340,Math.hypot(mx-vme.x,my2-vme.y));
+        const lx=vme.x+Math.cos(a)*dist, ly=vme.y+Math.sin(a)*dist;
         g.fillStyle(0xfbcb04,0.7); g.fillCircle(lx,ly,10);
-        g.lineStyle(1,0xfbcb04,0.4); g.lineBetween(me.x,me.y,lx,ly);
+        g.lineStyle(1,0xfbcb04,0.4); g.lineBetween(vme.x,vme.y,lx,ly);
       } else {
         // Show throw direction on mobile
         const a=this.mobileState.aimAngle;
         const dist=220;
-        const lx=me.x+Math.cos(a)*dist, ly=me.y+Math.sin(a)*dist;
+        const lx=vme.x+Math.cos(a)*dist, ly=vme.y+Math.sin(a)*dist;
         g.fillStyle(0xfbcb04,0.7); g.fillCircle(lx,ly,10);
-        g.lineStyle(1,0xfbcb04,0.4); g.lineBetween(me.x,me.y,lx,ly);
+        g.lineStyle(1,0xfbcb04,0.4); g.lineBetween(vme.x,vme.y,lx,ly);
       }
     }
 
@@ -798,9 +865,9 @@ class GameScene extends Phaser.Scene {
       }
     }
 
-    if (me&&!me.inMecha) {
+    if (vme&&!vme.inMecha) {
       for(const m of (this.gs.mechas||[])) {
-        if (!m.pilotId&&Math.hypot(m.x-me.x,m.y-me.y)<65) {
+        if (!m.pilotId&&Math.hypot(m.x-vme.x,m.y-vme.y)<65) {
           g.lineStyle(2,0xffd700,0.9); g.strokeCircle(m.x,m.y,26);
         }
       }
@@ -829,8 +896,11 @@ class GameScene extends Phaser.Scene {
     const me=this.gs?.players.find(p=>p.sid===this.myId)
            || this.gs?.players.find(p=>p.alive); // 폴백: 살아있는 첫 플레이어
     if (!me||!me.alive) return;
+    // Use predicted position for smoother fog movement
+    const meX=(me.sid===this.myId)?(this.predX??me.x):me.x;
+    const meY=(me.sid===this.myId)?(this.predY??me.y):me.y;
     const cam=this.cameras.main;
-    const sx=me.x-cam.scrollX, sy=me.y-cam.scrollY;
+    const sx=meX-cam.scrollX, sy=meY-cam.scrollY;
     const scope=this.gs.myScope;
     const baseVis=this.aiming&&scope?{scope2x:420,scope4x:490,scope8x:560,scope12x:650}[scope]||350:350;
 
